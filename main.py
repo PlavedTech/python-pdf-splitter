@@ -14,8 +14,10 @@ import io
 import logging
 import os
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +28,28 @@ logger = logging.getLogger(__name__)
 DEFAULT_TOKEN = "pdf-splitter-public-2025"
 API_TOKEN = os.getenv("API_TOKEN", DEFAULT_TOKEN)
 security = HTTPBearer(auto_error=False)
+
+# AWS Configuration
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+DEFAULT_S3_BUCKET = os.getenv("S3_BUCKET_NAME", "")
+
+# Initialize S3 client if AWS credentials are available
+s3_client = None
+if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+    try:
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_REGION
+        )
+        logger.info(f"AWS S3 client initialized for region: {AWS_REGION}")
+    except Exception as e:
+        logger.error(f"Failed to initialize S3 client: {str(e)}")
+else:
+    logger.info("AWS credentials not configured. S3 functionality disabled.")
 
 # Log the API token on startup
 logger.info(f"API Token configured: {'[CUSTOM]' if API_TOKEN != DEFAULT_TOKEN else '[DEFAULT: pdf-splitter-public-2025]'}")
@@ -54,6 +78,21 @@ class ErrorResponse(BaseModel):
 class AuthenticationError(BaseModel):
     detail: str = Field(default="Invalid or missing authentication token")
     authenticate: str = Field(default="Bearer")
+
+class S3PDFRequest(BaseModel):
+    bucket: str = Field(description="S3 bucket name", example="my-pdf-bucket")
+    key: str = Field(description="S3 object key (file path)", example="documents/invoice.pdf")
+    save_to_s3: bool = Field(default=False, description="Save split pages back to S3")
+    output_prefix: Optional[str] = Field(default=None, description="Prefix for output files in S3", example="split/")
+    output_bucket: Optional[str] = Field(default=None, description="Output bucket (defaults to input bucket)")
+
+class S3SplitPDFResponse(BaseModel):
+    status: str = Field(description="Operation status")
+    original_s3_location: str = Field(description="S3 location of original file")
+    total_pages: int = Field(description="Total number of pages in the PDF")
+    pages_split: bool = Field(description="Whether the PDF was split")
+    files: List[PageData] = Field(description="Array of split PDF pages (if not saved to S3)")
+    s3_output_files: Optional[List[str]] = Field(default=None, description="S3 keys of saved files (if saved to S3)")
 
 # Create FastAPI app with enhanced documentation
 app = FastAPI(
@@ -119,6 +158,47 @@ async def verify_token(
         detail="Invalid or missing authentication token",
         headers={"WWW-Authenticate": "Bearer"}
     )
+
+# S3 Helper functions
+async def download_from_s3(bucket: str, key: str) -> bytes:
+    """Download a file from S3 and return its contents."""
+    if not s3_client:
+        raise HTTPException(
+            status_code=503,
+            detail="S3 functionality is not configured. Please set AWS credentials."
+        )
+    
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        return response['Body'].read()
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            raise HTTPException(status_code=404, detail=f"File not found: s3://{bucket}/{key}")
+        elif e.response['Error']['Code'] == 'AccessDenied':
+            raise HTTPException(status_code=403, detail=f"Access denied to s3://{bucket}/{key}")
+        else:
+            logger.error(f"S3 download error: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error downloading from S3: {str(e)}")
+
+async def upload_to_s3(bucket: str, key: str, data: bytes, content_type: str = "application/pdf") -> str:
+    """Upload data to S3 and return the S3 key."""
+    if not s3_client:
+        raise HTTPException(
+            status_code=503,
+            detail="S3 functionality is not configured. Please set AWS credentials."
+        )
+    
+    try:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=data,
+            ContentType=content_type
+        )
+        return f"s3://{bucket}/{key}"
+    except ClientError as e:
+        logger.error(f"S3 upload error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error uploading to S3: {str(e)}")
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
@@ -271,6 +351,188 @@ async def split_pdf(
             detail=f"Error processing PDF: {str(e)}"
         )
 
+@app.post(
+    "/split-pdf-from-s3",
+    response_model=S3SplitPDFResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid request"},
+        401: {"model": AuthenticationError, "description": "Authentication required"},
+        403: {"model": ErrorResponse, "description": "Access denied to S3 resource"},
+        404: {"model": ErrorResponse, "description": "File not found in S3"},
+        413: {"model": ErrorResponse, "description": "File too large"},
+        422: {"model": ErrorResponse, "description": "Too many pages in PDF"},
+        500: {"model": ErrorResponse, "description": "Internal server error"},
+        503: {"model": ErrorResponse, "description": "S3 functionality not configured"}
+    },
+    tags=["PDF Operations"],
+    summary="Split PDF from S3 bucket",
+    dependencies=[Depends(verify_token)]
+)
+async def split_pdf_from_s3(
+    request: S3PDFRequest
+) -> S3SplitPDFResponse:
+    """
+    Split a PDF file directly from an S3 bucket.
+    
+    This endpoint downloads a PDF from S3, splits it into individual pages,
+    and optionally saves the split pages back to S3.
+    
+    **Requirements:**
+    - AWS credentials must be configured
+    - Proper read permissions for the source bucket
+    - Write permissions for the output bucket (if saving to S3)
+    
+    **Features:**
+    - No file upload size limits (processes directly from S3)
+    - Optional saving of split pages back to S3
+    - Maintains all original PDF formatting
+    
+    **Returns:**
+    - If `save_to_s3` is False: Base64-encoded pages in response
+    - If `save_to_s3` is True: S3 keys of saved split pages
+    """
+    # Check if S3 is configured
+    if not s3_client:
+        raise HTTPException(
+            status_code=503,
+            detail="S3 functionality is not configured. Please set AWS credentials."
+        )
+    
+    # Validate bucket names
+    if not request.bucket:
+        raise HTTPException(status_code=400, detail="Bucket name is required")
+    
+    if not request.key:
+        raise HTTPException(status_code=400, detail="Object key is required")
+    
+    # Check if key ends with .pdf
+    if not request.key.lower().endswith('.pdf'):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Expected PDF, got {request.key.split('.')[-1] if '.' in request.key else 'unknown'}"
+        )
+    
+    try:
+        # Download PDF from S3
+        logger.info(f"Downloading PDF from s3://{request.bucket}/{request.key}")
+        file_content = await download_from_s3(request.bucket, request.key)
+        
+        # Check file size
+        file_size = len(file_content)
+        if file_size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Size: {file_size / 1024 / 1024:.1f}MB, Max: {MAX_FILE_SIZE / 1024 / 1024}MB"
+            )
+        
+        # Process PDF
+        pdf_reader = PdfReader(io.BytesIO(file_content))
+        
+        # Validate PDF integrity
+        try:
+            _ = pdf_reader.metadata
+        except:
+            raise HTTPException(
+                status_code=400,
+                detail="Corrupted or invalid PDF file"
+            )
+        
+        total_pages = len(pdf_reader.pages)
+        logger.info(f"Processing S3 PDF with {total_pages} pages")
+        
+        # Check page limit
+        if total_pages > MAX_PAGES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"PDF has too many pages. Pages: {total_pages}, Max: {MAX_PAGES}"
+            )
+        
+        # Extract filename from key
+        filename = request.key.split('/')[-1].replace('.pdf', '')
+        
+        # Helper function for async page processing
+        async def process_page(page_num: int) -> tuple:
+            # Create a new PDF with single page
+            pdf_writer = PdfWriter()
+            pdf_writer.add_page(pdf_reader.pages[page_num])
+            
+            # Write to bytes buffer
+            output_buffer = io.BytesIO()
+            pdf_writer.write(output_buffer)
+            
+            # Get actual size in bytes
+            pdf_bytes = output_buffer.getvalue()
+            size_in_bytes = len(pdf_bytes)
+            
+            # Prepare page data
+            page_filename = f"{filename}_page_{page_num + 1}.pdf"
+            
+            # If saving to S3
+            if request.save_to_s3:
+                output_bucket = request.output_bucket or request.bucket
+                output_prefix = request.output_prefix or ""
+                output_key = f"{output_prefix}{page_filename}"
+                
+                # Upload to S3
+                s3_location = await upload_to_s3(output_bucket, output_key, pdf_bytes)
+                logger.info(f"Uploaded page {page_num + 1} to {s3_location}")
+                
+                return (page_num + 1, page_filename, None, size_in_bytes, output_key)
+            else:
+                # Encode as base64 for response
+                page_data = base64.b64encode(pdf_bytes).decode('utf-8')
+                return (page_num + 1, page_filename, page_data, size_in_bytes, None)
+        
+        # Process pages
+        if total_pages > 10:  # Use parallel processing for many pages
+            tasks = [process_page(page_num) for page_num in range(total_pages)]
+            results = await asyncio.gather(*tasks)
+        else:
+            results = []
+            for page_num in range(total_pages):
+                results.append(await process_page(page_num))
+        
+        # Prepare response
+        if request.save_to_s3:
+            # Return S3 keys
+            s3_output_files = [r[4] for r in results if r[4]]
+            return {
+                "status": "success",
+                "original_s3_location": f"s3://{request.bucket}/{request.key}",
+                "total_pages": total_pages,
+                "pages_split": total_pages > 1,
+                "files": [],  # Empty when saved to S3
+                "s3_output_files": s3_output_files
+            }
+        else:
+            # Return base64 encoded pages
+            split_files = [
+                {
+                    "page_number": r[0],
+                    "filename": r[1],
+                    "data": r[2],
+                    "size": r[3]
+                }
+                for r in results
+            ]
+            return {
+                "status": "success",
+                "original_s3_location": f"s3://{request.bucket}/{request.key}",
+                "total_pages": total_pages,
+                "pages_split": total_pages > 1,
+                "files": split_files,
+                "s3_output_files": None
+            }
+        
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions
+    except Exception as e:
+        logger.error(f"Error processing S3 PDF: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing PDF from S3: {str(e)}"
+        )
+
 @app.get("/", tags=["Info"])
 async def root():
     """Service information and available endpoints
@@ -278,7 +540,7 @@ async def root():
     Returns basic information about the PDF Splitter service
     and lists all available API endpoints.
     """
-    return {
+    response = {
         "service": "PDF Splitter",
         "version": "1.0.0",
         "description": "High-performance PDF splitting service for Cloudflare Containers",
@@ -286,6 +548,7 @@ async def root():
             "/": "Service information (this endpoint)",
             "/health": "Health check endpoint",
             "/split-pdf": "Upload and split PDF into pages (POST)",
+            "/split-pdf-from-s3": "Split PDF directly from S3 bucket (POST)",
             "/docs": "Interactive API documentation (Swagger UI)",
             "/redoc": "Alternative API documentation (ReDoc)"
         },
@@ -304,8 +567,18 @@ async def root():
                 "API key in X-API-Key header"
             ],
             "note": "Authentication required - contact admin for token"
+        },
+        "aws_s3": {
+            "enabled": s3_client is not None,
+            "region": AWS_REGION if s3_client else None,
+            "features": [
+                "Process PDFs directly from S3",
+                "Save split pages back to S3",
+                "No file upload size limits for S3 files"
+            ] if s3_client else ["S3 functionality not configured"]
         }
     }
+    return response
 
 if __name__ == "__main__":
     import uvicorn

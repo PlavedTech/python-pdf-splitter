@@ -36,6 +36,8 @@ This service requires authentication using an API token. You can authenticate us
 - ✅ Auto-scaling with Cloudflare Containers (1-5 instances)
 - ✅ Interactive API documentation
 - ✅ Health monitoring endpoint
+- ✅ **AWS S3 Integration** - Process PDFs directly from S3
+- ✅ **S3 Output Support** - Save split pages back to S3
 
 ## 📊 Service Limits
 
@@ -84,6 +86,55 @@ curl -X POST \
   -H "Authorization: Bearer pdf-splitter-public-2025" \
   -F "file=@document.pdf" \
   https://pdf-splitter-service.carles-64e.workers.dev/split-pdf
+```
+
+### 4. Split PDF from S3 (Requires Authentication)
+```http
+POST /split-pdf-from-s3
+```
+Process a PDF directly from an S3 bucket without uploading.
+
+**Headers Required:**
+- `Authorization: Bearer <token>` or `X-API-Key: <token>`
+- `Content-Type: application/json`
+
+**Request Body:**
+```json
+{
+  "bucket": "my-pdf-bucket",
+  "key": "documents/invoice.pdf",
+  "save_to_s3": false,
+  "output_prefix": "split/",
+  "output_bucket": "my-output-bucket"
+}
+```
+
+**Example - Download split pages:**
+```bash
+curl -X POST \
+  -H "Authorization: Bearer pdf-splitter-public-2025" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "bucket": "my-bucket",
+    "key": "documents/invoice.pdf",
+    "save_to_s3": false
+  }' \
+  https://pdf-splitter-service.carles-64e.workers.dev/split-pdf-from-s3
+```
+
+**Example - Save split pages to S3:**
+```bash
+curl -X POST \
+  -H "Authorization: Bearer pdf-splitter-public-2025" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "bucket": "my-bucket",
+    "key": "documents/invoice.pdf",
+    "save_to_s3": true,
+    "output_prefix": "split/invoice/",
+    "output_bucket": "my-output-bucket"
+  }' \
+  https://pdf-splitter-service.carles-64e.workers.dev/split-pdf-from-s3
 ```
 
 ## 💻 Integration Examples
@@ -181,11 +232,56 @@ class PDFSplitter:
             return data
         else:
             raise Exception(f"Error: {response.json()['detail']}")
+    
+    def split_pdf_from_s3(self, bucket, key, save_to_s3=False, output_prefix=None):
+        """Split a PDF directly from S3."""
+        url = f"{self.base_url}/split-pdf-from-s3"
+        headers = {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "bucket": bucket,
+            "key": key,
+            "save_to_s3": save_to_s3,
+            "output_prefix": output_prefix
+        }
+        
+        response = requests.post(url, json=payload, headers=headers)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            if save_to_s3:
+                print(f"✅ Split {data['total_pages']} pages to S3")
+                for s3_key in data.get('s3_output_files', []):
+                    print(f"  - {s3_key}")
+            else:
+                # Save locally if not saving to S3
+                for page_info in data['files']:
+                    page_data = base64.b64decode(page_info['data'])
+                    with open(page_info['filename'], 'wb') as f:
+                        f.write(page_data)
+                        print(f"✅ Saved {page_info['filename']}")
+            
+            return data
+        else:
+            raise Exception(f"Error: {response.json()['detail']}")
 
-# Usage
+# Usage - Upload file
 splitter = PDFSplitter("pdf-splitter-public-2025")
 result = splitter.split_pdf("document.pdf")
 print(f"Split {result['total_pages']} pages successfully!")
+
+# Usage - Process from S3
+result = splitter.split_pdf_from_s3(
+    bucket="my-bucket",
+    key="documents/invoice.pdf",
+    save_to_s3=True,
+    output_prefix="split/"
+)
+print(f"Processed {result['total_pages']} pages from S3!")
 ```
 
 ### JavaScript/Node.js Integration
@@ -377,7 +473,18 @@ curl -X POST \
    # Enter your desired token when prompted
    ```
 
-5. **Deploy**
+5. **Configure AWS Credentials (Optional - for S3 integration)**
+   ```bash
+   # Set AWS credentials as secrets
+   wrangler secret put AWS_ACCESS_KEY_ID
+   wrangler secret put AWS_SECRET_ACCESS_KEY
+   
+   # Optionally set the region and default bucket
+   wrangler secret put AWS_REGION  # Default: us-east-1
+   wrangler secret put S3_BUCKET_NAME  # Optional default bucket
+   ```
+
+6. **Deploy**
    ```bash
    wrangler deploy
    ```
@@ -419,9 +526,58 @@ curl -X POST \
 
 ### Environment Variables
 
+**Required:**
 - `API_TOKEN` - Authentication token (stored as secret)
+
+**Optional (for S3 integration):**
+- `AWS_ACCESS_KEY_ID` - AWS access key for S3 operations
+- `AWS_SECRET_ACCESS_KEY` - AWS secret key for S3 operations
+- `AWS_REGION` - AWS region (default: us-east-1)
+- `S3_BUCKET_NAME` - Default S3 bucket name (optional)
+
+**Service Configuration:**
 - `SERVICE_NAME` - Service identifier
 - `VERSION` - Service version
+
+## 🔐 AWS S3 Configuration
+
+### Required IAM Permissions
+
+When using S3 integration, ensure your AWS IAM user/role has these permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::your-bucket-name/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::your-bucket-name"
+      ]
+    }
+  ]
+}
+```
+
+### S3 Bucket Configuration
+
+Ensure your S3 bucket has:
+- Proper ACLs for the IAM user/role
+- Versioning enabled (optional but recommended)
+- Lifecycle policies for old split files (optional)
 
 ## 🐳 Local Development
 
@@ -432,9 +588,13 @@ curl -X POST \
    pip install -r requirements.txt
    ```
 
-2. **Set environment variable**
+2. **Set environment variables**
    ```bash
    export API_TOKEN="your-local-test-token"
+   # For S3 integration (optional)
+   export AWS_ACCESS_KEY_ID="your-access-key"
+   export AWS_SECRET_ACCESS_KEY="your-secret-key"
+   export AWS_REGION="us-east-1"
    ```
 
 3. **Run the service**
