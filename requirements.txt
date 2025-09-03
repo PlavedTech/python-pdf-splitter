@@ -1,5 +1,6 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-python-multipart==0.0.6
-pypdf==3.17.1
-pydantic==2.5.0
+fastapi==0.115.5
+uvicorn==0.32.1
+python-multipart==0.0.12
+pypdf==5.1.0
+pydantic==2.10.3
+boto3==1.35.68
