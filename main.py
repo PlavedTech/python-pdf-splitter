@@ -13,6 +13,7 @@ import base64
 import io
 import logging
 import os
+import asyncio
 from typing import List, Optional
 from pydantic import BaseModel, Field
 
@@ -201,6 +202,15 @@ async def split_pdf(
         # Read the PDF from already loaded content
         pdf_reader = PdfReader(io.BytesIO(file_content))
         
+        # Validate PDF integrity
+        try:
+            _ = pdf_reader.metadata  # Check if PDF is valid and readable
+        except:
+            raise HTTPException(
+                status_code=400,
+                detail="Corrupted or invalid PDF file"
+            )
+        
         total_pages = len(pdf_reader.pages)
         logger.info(f"Processing PDF '{file.filename}' with {total_pages} pages")
         
@@ -211,10 +221,8 @@ async def split_pdf(
                 detail=f"PDF has too many pages. Pages: {total_pages}, Max: {MAX_PAGES}"
             )
         
-        # Split PDF into individual pages
-        split_files = []
-        
-        for page_num in range(total_pages):
+        # Helper function for async page processing
+        async def process_page(page_num: int) -> dict:
             # Create a new PDF with single page
             pdf_writer = PdfWriter()
             pdf_writer.add_page(pdf_reader.pages[page_num])
@@ -222,19 +230,31 @@ async def split_pdf(
             # Write to bytes buffer
             output_buffer = io.BytesIO()
             pdf_writer.write(output_buffer)
-            output_buffer.seek(0)
+            
+            # Get actual size in bytes before encoding
+            pdf_bytes = output_buffer.getvalue()
+            size_in_bytes = len(pdf_bytes)
             
             # Encode as base64
-            page_data = base64.b64encode(output_buffer.read()).decode('utf-8')
+            page_data = base64.b64encode(pdf_bytes).decode('utf-8')
             
-            split_files.append({
+            logger.info(f"Processed page {page_num + 1}/{total_pages}")
+            
+            return {
                 "page_number": page_num + 1,
                 "filename": f"page_{page_num + 1}.pdf",
                 "data": page_data,
-                "size": len(page_data)
-            })
-            
-            logger.info(f"Processed page {page_num + 1}/{total_pages}")
+                "size": size_in_bytes  # Actual bytes, not base64 string length
+            }
+        
+        # Process pages in parallel for better performance
+        if total_pages > 10:  # Use parallel processing for PDFs with many pages
+            tasks = [process_page(page_num) for page_num in range(total_pages)]
+            split_files = await asyncio.gather(*tasks)
+        else:  # Sequential for small PDFs to avoid overhead
+            split_files = []
+            for page_num in range(total_pages):
+                split_files.append(await process_page(page_num))
         
         return {
             "status": "success",
@@ -283,7 +303,7 @@ async def root():
                 "Bearer token in Authorization header",
                 "API key in X-API-Key header"
             ],
-            "note": "Default token: pdf-splitter-public-2025 (change in production)"
+            "note": "Authentication required - contact admin for token"
         }
     }
 
